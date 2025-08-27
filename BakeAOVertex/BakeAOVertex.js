@@ -1,4 +1,4 @@
-// Ambient Occlusion Baker.js script for Cheetah3D
+// Vertex ambient occlusion baker script for Cheetah3D
 // Intersection based on Möller-Trumbore, 1997
 // Spherical monte carlo integration
 // Bakes ambient occlusion into UV (because we can't modify via javascript yet via Cheetah3D API)
