@@ -8,10 +8,10 @@
 // 2. tools -> script -> tag -> TerrainProjector.js
 // 3. In inspector, type the exact name of your terrain mesh into "Terrain Name"
 // 4. Press the "Project" button in inspector
-// 
 //
 // Assumes the terrain is a regular grid mesh aligned to XZ.
-// Uses direct cell lookup for O(1) triangle retrieval per vertex.
+// Uses bilinear interpolation on a flat heightmap for O(1) height
+// lookup per vertex.
 
 function buildUI(tool) {
     tool.addParameterSeparator("Terrain Projector");
@@ -22,7 +22,6 @@ function buildUI(tool) {
     tool.addParameterButton("Project", "Project onto Terrain", "projectOntoTerrain");
 }
 
-// Recursively search the scene graph for an object by name.
 function findObjectByName(obj, name) {
     if (obj.getParameter("name") === name) return obj;
     for (var i = 0; i < obj.childCount(); i++) {
@@ -32,229 +31,94 @@ function findObjectByName(obj, name) {
     return null;
 }
 
-// Find the highest world-space Y by scanning ALL vertices.
-function findMaxY(meshObj) {
-    var core = meshObj.modCore();
-    if (!core) core = meshObj.core();
-    var matrix    = meshObj.obj2WorldMatrix();
-    var maxY      = -Infinity;
-    var vertCount = core.vertexCount();
-    for (var i = 0; i < vertCount; i++) {
-        var wv = matrix.multiply(core.vertex(i));
-        if (wv.y > maxY) maxY = wv.y;
-    }
-    return maxY;
-}
-
-// Build a regular grid index from a terrain mesh.
-//
-// Figures out the grid resolution (cols x rows) by finding the
-// unique sorted X and Z vertex positions. Works for any regular
-// grid regardless of spacing or world transform.
-//
-// Returns:
-// {
-//   tris,       // array of [v0,v1,v2] (world-space Vec3D)
-//               // laid out as: cell(cx,cz) = tris at indices
-//               //   (cz * cols + cx) * 2 + 0  (lower-left tri)
-//               //   (cz * cols + cx) * 2 + 1  (upper-right tri)
-//   xs,         // sorted unique X values of grid vertices
-//   zs,         // sorted unique Z values of grid vertices
-//   cols,       // number of cells in X  = xs.length - 1
-//   rows        // number of cells in Z  = zs.length - 1
-// }
-function buildRegularGridIndex(meshObj) {
+// Build a flat heightmap from a regular XZ-aligned terrain mesh.
+// Grid vertex (xi, zi) -> Y stored at heightmap[zi * cols + xi].
+// stepX and stepZ may differ (rectangular cells are fine).
+function buildHeightmap(meshObj) {
     var core = meshObj.modCore();
     if (!core) core = meshObj.core();
     var matrix    = meshObj.obj2WorldMatrix();
     var vertCount = core.vertexCount();
 
-    // --- Collect all world-space vertex positions ---
-    var verts = [];
+    var minX =  Infinity, maxX = -Infinity;
+    var minZ =  Infinity, maxZ = -Infinity;
+
+    var wx = [], wy = [], wz = [];
     for (var i = 0; i < vertCount; i++) {
         var wv = matrix.multiply(core.vertex(i));
-        verts.push(wv);
+        wx.push(wv.x);
+        wy.push(wv.y);
+        wz.push(wv.z);
+        if (wv.x < minX) minX = wv.x;
+        if (wv.x > maxX) maxX = wv.x;
+        if (wv.z < minZ) minZ = wv.z;
+        if (wv.z > maxZ) maxZ = wv.z;
     }
 
-    // --- Find unique sorted X and Z values ---
-    // Use a tolerance to merge near-identical floats
+    // Count vertices in the first row (Z ~ minZ) to get cols
     var MERGE_TOL = 1e-5;
+    var cols = 0;
+    for (var i = 0; i < vertCount; i++) {
+        if (Math.abs(wz[i] - minZ) < MERGE_TOL) cols++;
+    }
+    var rows  = vertCount / cols;
+    var stepX = (maxX - minX) / (cols - 1);
+    var stepZ = (maxZ - minZ) / (rows - 1);
 
-    function collectUnique(vals) {
-        vals.sort(function(a, b) { return a - b; });
-        var unique = [vals[0]];
-        for (var i = 1; i < vals.length; i++) {
-            if (vals[i] - unique[unique.length - 1] > MERGE_TOL) {
-                unique.push(vals[i]);
-            }
-        }
-        return unique;
+    print("TerrainProjector: Heightmap " + cols + "x" + rows
+        + " verts, stepX=" + stepX.toFixed(5)
+        + " stepZ=" + stepZ.toFixed(5));
+
+    var heightmap = [];
+    for (var i = 0; i < cols * rows; i++) heightmap.push(0.0);
+
+    var maxY = -Infinity;
+    for (var i = 0; i < vertCount; i++) {
+        var xi = Math.round((wx[i] - minX) / stepX);
+        var zi = Math.round((wz[i] - minZ) / stepZ);
+        heightmap[zi * cols + xi] = wy[i];
+        if (wy[i] > maxY) maxY = wy[i];
     }
 
-    var allX = [], allZ = [];
-    for (var i = 0; i < verts.length; i++) {
-        allX.push(verts[i].x);
-        allZ.push(verts[i].z);
-    }
-    var xs = collectUnique(allX);
-    var zs = collectUnique(allZ);
-
-    var cols = xs.length - 1; // cells in X
-    var rows = zs.length - 1; // cells in Z
-
-    print("TerrainProjector: Grid " + xs.length + "x" + zs.length
-        + " vertices = " + cols + "x" + rows + " cells ("
-        + (cols * rows * 2) + " triangles)");
-
-    // --- Build a vertex lookup: (xi, zi) -> world-space Vec3D ---
-    // For each vertex, find its xi and zi indices in xs/zs.
-    // Binary search for speed.
-    function bisect(arr, val) {
-        var lo = 0, hi = arr.length - 1;
-        while (lo < hi) {
-            var mid = (lo + hi) >> 1;
-            if (arr[mid] < val - MERGE_TOL) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
-    // vertGrid[zi][xi] = world-space Vec3D
-    var vertGrid = [];
-    for (var zi = 0; zi < zs.length; zi++) {
-        var row = [];
-        for (var xi = 0; xi < xs.length; xi++) row.push(null);
-        vertGrid.push(row);
-    }
-
-    for (var i = 0; i < verts.length; i++) {
-        var xi = bisect(xs, verts[i].x);
-        var zi = bisect(zs, verts[i].z);
-        vertGrid[zi][xi] = verts[i];
-    }
-
-    // --- Build triangle array: 2 tris per cell, ordered by cell ---
-    // Each quad cell (cx, cz) has corners:
-    //   BL = vertGrid[cz  ][cx  ]
-    //   BR = vertGrid[cz  ][cx+1]
-    //   TL = vertGrid[cz+1][cx  ]
-    //   TR = vertGrid[cz+1][cx+1]
-    //
-    // Split into:
-    //   tri0: BL, BR, TR  (lower-right triangle)
-    //   tri1: BL, TR, TL  (upper-left triangle)
-    //
-    // Cell (cx,cz) -> tris[(cz*cols+cx)*2] and [*2+1]
-
-    var tris = [];
-    for (var cz = 0; cz < rows; cz++) {
-        for (var cx = 0; cx < cols; cx++) {
-            var BL = vertGrid[cz  ][cx  ];
-            var BR = vertGrid[cz  ][cx+1];
-            var TL = vertGrid[cz+1][cx  ];
-            var TR = vertGrid[cz+1][cx+1];
-            tris.push([BL, BR, TR]); // tri0
-            tris.push([BL, TR, TL]); // tri1
-        }
-    }
-
-    return { tris: tris, xs: xs, zs: zs, cols: cols, rows: rows };
+    return {
+        heightmap: heightmap,
+        minX: minX, minZ: minZ,
+        stepX: stepX, stepZ: stepZ,
+        cols: cols, rows: rows,
+        maxY: maxY
+    };
 }
 
-// For a point (x, z), return triangle indices to test.
-// Tests the cell it falls in plus its 8 neighbours (3x3 = 18 tris)
-// to handle floating point edge cases.
-function getCandidateTriIndices(index, x, z) {
-    // Binary search for cell
-    function bisect(arr, val) {
-        var lo = 0, hi = arr.length - 2; // hi = last cell index
-        while (lo < hi) {
-            var mid = (lo + hi + 1) >> 1;
-            if (arr[mid] <= val) lo = mid;
-            else hi = mid - 1;
-        }
-        return lo;
-    }
+// Sample terrain height at world (x, z) using bilinear interpolation.
+// The quad is split along the BL-TR diagonal to match the mesh topology.
+// Returns Y or null if the point is outside the terrain bounds.
+function sampleHeight(hm, x, z) {
+    var gx = (x - hm.minX) / hm.stepX;
+    var gz = (z - hm.minZ) / hm.stepZ;
 
-    var cx = bisect(index.xs, x);
-    var cz = bisect(index.zs, z);
+    var cx = Math.floor(gx);
+    var cz = Math.floor(gz);
 
-    var result = [];
-    // 3x3 neighbourhood
-    for (var dz = -1; dz <= 1; dz++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            var nx = cx + dx;
-            var nz = cz + dz;
-            if (nx >= 0 && nx < index.cols && nz >= 0 && nz < index.rows) {
-                var base = (nz * index.cols + nx) * 2;
-                result.push(base);     // tri0
-                result.push(base + 1); // tri1
-            }
-        }
+    if (cx < 0 || cx >= hm.cols - 1 || cz < 0 || cz >= hm.rows - 1) return null;
+
+    var fx = gx - cx;
+    var fz = gz - cz;
+
+    var h00 = hm.heightmap[ cz      * hm.cols + cx    ]; // BL
+    var h10 = hm.heightmap[ cz      * hm.cols + cx + 1]; // BR
+    var h01 = hm.heightmap[(cz + 1) * hm.cols + cx    ]; // TL
+    var h11 = hm.heightmap[(cz + 1) * hm.cols + cx + 1]; // TR
+
+    // Lower-right triangle (BL, BR, TR): fz < 1 - fx
+    // Upper-left triangle  (BL, TR, TL): fz >= 1 - fx
+    if (fz < 1.0 - fx) {
+        return h00 + fx * (h10 - h00) + fz * (h11 - h10);
+    } else {
+        return h01 + fx * (h11 - h01) + (1.0 - fz) * (h00 - h01);
     }
-    return result;
 }
 
-// Möller-Trumbore ray-triangle intersection.
-// Ray shoots straight down: origin P, direction D=(0,-1,0).
-// Returns t (distance) or -1 if no intersection.
-function rayTriangleIntersect(P, v0, v1, v2) {
-    var EPSILON   = 1e-8;
-    var TOLERANCE = -1e-6;
-
-    var Dx = 0.0, Dy = -1.0, Dz = 0.0;
-
-    var e1x = v1.x - v0.x, e1y = v1.y - v0.y, e1z = v1.z - v0.z;
-    var e2x = v2.x - v0.x, e2y = v2.y - v0.y, e2z = v2.z - v0.z;
-
-    var hx = Dy*e2z - Dz*e2y;
-    var hy = Dz*e2x - Dx*e2z;
-    var hz = Dx*e2y - Dy*e2x;
-
-    var a = e1x*hx + e1y*hy + e1z*hz;
-    if (a > -EPSILON && a < EPSILON) return -1;
-
-    var f  = 1.0 / a;
-    var sx = P.x - v0.x, sy = P.y - v0.y, sz = P.z - v0.z;
-
-    var u = f * (sx*hx + sy*hy + sz*hz);
-    if (u < TOLERANCE || u > 1.0 - TOLERANCE) return -1;
-
-    var qx = sy*e1z - sz*e1y;
-    var qy = sz*e1x - sx*e1z;
-    var qz = sx*e1y - sy*e1x;
-
-    var v = f * (Dx*qx + Dy*qy + Dz*qz);
-    if (v < TOLERANCE || u + v > 1.0 - TOLERANCE) return -1;
-
-    var t = f * (e2x*qx + e2y*qy + e2z*qz);
-    if (t < EPSILON) return -1;
-
-    return t;
-}
-
-// ---------------------------------------------------------------
-// Project a single XZ point downward using the grid index.
-// Returns the Y of the hit, or null if no triangle was hit.
-// ---------------------------------------------------------------
-function projectPoint(x, z, maxY, index) {
-    var P          = new Vec3D(x, maxY + 0.001, z);
-    var candidates = getCandidateTriIndices(index, x, z);
-    var bestY      = null;
-
-    for (var i = 0; i < candidates.length; i++) {
-        var tri = index.tris[candidates[i]];
-        var t   = rayTriangleIntersect(P, tri[0], tri[1], tri[2]);
-        if (t >= 0) {
-            var hitY = P.y - t;
-            if (bestY === null || hitY > bestY) bestY = hitY;
-        }
-    }
-
-    return bestY;
-}
-
-// Build vertex adjacency list from polygon data.
+// Build a vertex adjacency list from polygon data.
 function buildVertexAdjacency(core) {
     var vertCount = core.vertexCount();
     var polyCount = core.polygonCount();
@@ -280,7 +144,8 @@ function buildVertexAdjacency(core) {
     return adj;
 }
 
-// Find connected components via BFS.
+// Find connected components via iterative BFS flood fill.
+// Returns an array of components, each being an array of vertex indices.
 function findConnectedComponents(core) {
     var vertCount = core.vertexCount();
     var adj       = buildVertexAdjacency(core);
@@ -307,7 +172,6 @@ function findConnectedComponents(core) {
     return components;
 }
 
-// Main button callback
 function projectOntoTerrain(tool) {
     var doc            = tool.document();
     var roadObj        = doc.selectedObject();
@@ -330,14 +194,9 @@ function projectOntoTerrain(tool) {
         return;
     }
 
-    var maxY = findMaxY(terrainObj);
-    print("TerrainProjector: Terrain max Y = " + maxY);
-
-    var index = buildRegularGridIndex(terrainObj);
-    if (index.tris.length === 0) {
-        OS.messageBox("Error", "Terrain mesh has no polygons.");
-        return;
-    }
+    print("TerrainProjector: Building heightmap...");
+    var hm = buildHeightmap(terrainObj);
+    print("TerrainProjector: Terrain max Y = " + hm.maxY);
 
     var roadCore = roadObj.core();
     if (!roadCore || roadCore.vertexCount() === 0) {
@@ -354,10 +213,9 @@ function projectOntoTerrain(tool) {
     var hits = 0, misses = 0;
 
     if (!groupConnected) {
-        // Simple mode: project each vertex independently
         for (var i = 0; i < vertCount; i++) {
             var worldPos = roadMatrix.multiply(roadCore.vertex(i));
-            var hitY     = projectPoint(worldPos.x, worldPos.z, maxY, index);
+            var hitY     = sampleHeight(hm, worldPos.x, worldPos.z);
             if (hitY !== null) {
                 var nwp = new Vec3D(worldPos.x, hitY + yOffset, worldPos.z);
                 roadCore.setVertex(i, roadMatrixInv.multiply(nwp));
@@ -367,7 +225,6 @@ function projectOntoTerrain(tool) {
             }
         }
     } else {
-        // Building mode: one ray per connected component
         print("TerrainProjector: Finding connected components...");
         var components = findConnectedComponents(roadCore);
         print("TerrainProjector: Found " + components.length + " components.");
@@ -383,10 +240,10 @@ function projectOntoTerrain(tool) {
                 if (wp.y < minY) minY = wp.y;
             }
 
-            var hitY = projectPoint(
+            var hitY = sampleHeight(
+                hm,
                 sumX / component.length,
-                sumZ / component.length,
-                maxY, index
+                sumZ / component.length
             );
 
             if (hitY !== null) {
