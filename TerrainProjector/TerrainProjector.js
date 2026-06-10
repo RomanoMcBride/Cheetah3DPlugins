@@ -24,7 +24,6 @@ function buildUI(tool) {
 }
 
 // Try to fill a heightmap with given cols/rows, return collision count.
-// If collisions is 0 the orientation is correct.
 function tryFillHeightmap(wx, wy, wz, vertCount, cols, rows, minX, minZ, stepX, stepZ) {
     var heightmap = [];
     var filled    = [];
@@ -39,7 +38,6 @@ function tryFillHeightmap(wx, wy, wz, vertCount, cols, rows, minX, minZ, stepX, 
     for (var i = 0; i < vertCount; i++) {
         var xi  = Math.round((wx[i] - minX) / stepX);
         var zi  = Math.round((wz[i] - minZ) / stepZ);
-        // Clamp to valid range
         if (xi < 0) xi = 0; if (xi >= cols) xi = cols - 1;
         if (zi < 0) zi = 0; if (zi >= rows) zi = rows - 1;
         var idx = zi * cols + xi;
@@ -53,9 +51,8 @@ function tryFillHeightmap(wx, wy, wz, vertCount, cols, rows, minX, minZ, stepX, 
 }
 
 // Build a flat heightmap from a regular XZ-aligned terrain mesh.
-// Tries both possible grid orientations (cols x rows and rows x cols)
-// and picks the one with fewest collisions.
-// Grid vertex (xi, zi) -> Y stored at heightmap[zi * cols + xi].
+// Tries both possible grid orientations and picks the one with
+// fewest collisions.
 function buildHeightmap(meshObj) {
     var core = meshObj.modCore();
     if (!core) core = meshObj.core();
@@ -78,37 +75,31 @@ function buildHeightmap(meshObj) {
         if (wv.z > maxZ) maxZ = wv.z;
     }
 
-    // Derive cols candidates from quadratic formula.
-    // vertCount = cols * rows, polyCount = (cols-1)*(rows-1)
-    // => cols^2 - (V - P + 1)*cols + V = 0
     var b            = -(vertCount - polyCount + 1);
     var discriminant = b*b - 4*vertCount;
     var sq           = Math.sqrt(Math.max(0, discriminant));
     var c1           = Math.round((-b + sq) / 2);
     var c2           = Math.round((-b - sq) / 2);
 
-    // Also try the row-counting method as a third candidate
     var MERGE_TOL = 1e-5;
     var colsByRow = 0;
     for (var i = 0; i < vertCount; i++) {
         if (Math.abs(wz[i] - minZ) < MERGE_TOL) colsByRow++;
     }
 
-    // Collect unique candidates (cols and their transpose rows)
     var candidates = [];
     function addCandidate(c) {
         if (c > 1 && vertCount % c === 0) candidates.push(c);
     }
     addCandidate(c1);
     addCandidate(c2);
-    addCandidate(Math.round(vertCount / c1)); // transpose of c1
-    addCandidate(Math.round(vertCount / c2)); // transpose of c2
+    addCandidate(Math.round(vertCount / c1));
+    addCandidate(Math.round(vertCount / c2));
     addCandidate(colsByRow);
     addCandidate(Math.round(vertCount / colsByRow));
 
     print("TerrainProjector: Trying " + candidates.length + " grid orientations...");
 
-    // Try each candidate and pick the one with fewest collisions
     var bestResult = null;
     var bestCols   = 0;
     var bestRows   = 0;
@@ -138,7 +129,6 @@ function buildHeightmap(meshObj) {
             bestStepZ  = stepZ;
         }
 
-        // Perfect solution found - no need to try more
         if (result.collisions === 0) break;
     }
 
@@ -158,30 +148,24 @@ function buildHeightmap(meshObj) {
 }
 
 // Sample terrain height at world (x, z) using bilinear interpolation.
-// The quad is split along the BL-TR diagonal to match the mesh topology.
-// Points outside terrain bounds are clamped to the nearest terrain edge,
-// effectively extending the heightmap infinitely in all directions.
+// Points outside terrain bounds are clamped to the nearest terrain edge.
 function sampleHeight(hm, x, z) {
     var gx = (x - hm.minX) / hm.stepX;
     var gz = (z - hm.minZ) / hm.stepZ;
 
-    // Clamp to valid cell range
     gx = Math.max(0, Math.min(gx, hm.cols - 1 - 1e-10));
     gz = Math.max(0, Math.min(gz, hm.rows - 1 - 1e-10));
 
     var cx = Math.floor(gx);
     var cz = Math.floor(gz);
-
     var fx = gx - cx;
     var fz = gz - cz;
 
-    var h00 = hm.heightmap[ cz      * hm.cols + cx    ]; // BL
-    var h10 = hm.heightmap[ cz      * hm.cols + cx + 1]; // BR
-    var h01 = hm.heightmap[(cz + 1) * hm.cols + cx    ]; // TL
-    var h11 = hm.heightmap[(cz + 1) * hm.cols + cx + 1]; // TR
+    var h00 = hm.heightmap[ cz      * hm.cols + cx    ];
+    var h10 = hm.heightmap[ cz      * hm.cols + cx + 1];
+    var h01 = hm.heightmap[(cz + 1) * hm.cols + cx    ];
+    var h11 = hm.heightmap[(cz + 1) * hm.cols + cx + 1];
 
-    // Lower-right triangle (BL, BR, TR): fz < 1 - fx
-    // Upper-left triangle  (BL, TR, TL): fz >= 1 - fx
     if (fz < 1.0 - fx) {
         return h00 + fx * (h10 - h00) + fz * (h11 - h10);
     } else {
@@ -189,58 +173,65 @@ function sampleHeight(hm, x, z) {
     }
 }
 
-// Build a vertex adjacency list using a hash set for deduplication.
-function buildVertexAdjacency(core) {
-    var vertCount = core.vertexCount();
-    var polyCount = core.polygonCount();
-    var edgeSet   = {};
-    var adj       = [];
-    for (var i = 0; i < vertCount; i++) adj.push([]);
-
-    for (var p = 0; p < polyCount; p++) {
-        var polySize  = core.polygonSize(p);
-        var polyVerts = [];
-        for (var c = 0; c < polySize; c++) polyVerts.push(core.vertexIndex(p, c));
-        for (var a = 0; a < polyVerts.length; a++) {
-            for (var b = 0; b < polyVerts.length; b++) {
-                if (a === b) continue;
-                var va  = polyVerts[a], vb = polyVerts[b];
-                var key = va + "_" + vb;
-                if (!edgeSet[key]) {
-                    edgeSet[key] = true;
-                    adj[va].push(vb);
-                }
-            }
-        }
-    }
-    return adj;
+// new union-find assuming disjointed set
+function makeUnionFind(n) {
+    var parent = [], rank = [];
+    for (var i = 0; i < n; i++) {
+		parent.push(i); rank.push(0);
+	}
+    return { parent: parent, rank: rank };
 }
 
-// Find connected components via iterative BFS flood fill.
+function ufFind(uf, x) {
+    // Path compression: flatten the tree as we search
+    while (uf.parent[x] !== x) {
+        uf.parent[x] = uf.parent[uf.parent[x]]; // path halving
+        x = uf.parent[x];
+    }
+    return x;
+}
+
+function ufUnion(uf, x, y) {
+    var rx = ufFind(uf, x);
+    var ry = ufFind(uf, y);
+    if (rx === ry) return;
+    // Union by rank: attach smaller tree under larger tree
+    if (uf.rank[rx] < uf.rank[ry]) { var tmp = rx; rx = ry; ry = tmp; }
+    uf.parent[ry] = rx;
+    if (uf.rank[rx] === uf.rank[ry]) uf.rank[rx]++;
+}
+
+// Find connected components using Union-Find.
 // Returns an array of components, each being an array of vertex indices.
+// O(P * polySize) to build, O(V) to collect -- vs old O(V * P * polySize^2)
 function findConnectedComponents(core) {
     var vertCount = core.vertexCount();
-    var adj       = buildVertexAdjacency(core);
-    var visited   = [];
-    for (var i = 0; i < vertCount; i++) visited.push(false);
+    var polyCount = core.polygonCount();
+    var uf        = makeUnionFind(vertCount);
 
-    var components = [];
-    for (var start = 0; start < vertCount; start++) {
-        if (visited[start]) continue;
-        var component  = [];
-        var queue      = [start];
-        visited[start] = true;
-        while (queue.length > 0) {
-            var current    = queue.shift();
-            component.push(current);
-            var neighbours = adj[current];
-            for (var n = 0; n < neighbours.length; n++) {
-                var nb = neighbours[n];
-                if (!visited[nb]) { visited[nb] = true; queue.push(nb); }
-            }
+    // Union all vertices that share a polygon
+    for (var p = 0; p < polyCount; p++) {
+        var polySize = core.polygonSize(p);
+        var first    = core.vertexIndex(p, 0);
+        // Only need to union each vert with the first vert in the poly --
+        // transitivity of union-find does the rest
+        for (var c = 1; c < polySize; c++) {
+            ufUnion(uf, first, core.vertexIndex(p, c));
         }
-        components.push(component);
     }
+
+    // Collect components: group vertices by their root
+    var rootMap    = {};
+    var components = [];
+    for (var i = 0; i < vertCount; i++) {
+        var root = ufFind(uf, i);
+        if (rootMap[root] === undefined) {
+            rootMap[root] = components.length;
+            components.push([]);
+        }
+        components[rootMap[root]].push(i);
+    }
+
     return components;
 }
 
