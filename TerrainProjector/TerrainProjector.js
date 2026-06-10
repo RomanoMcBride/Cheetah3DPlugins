@@ -23,10 +23,39 @@ function buildUI(tool) {
     tool.addParameterButton("Project", "Project onto Terrain", "projectOntoTerrain");
 }
 
+// Try to fill a heightmap with given cols/rows, return collision count.
+// If collisions is 0 the orientation is correct.
+function tryFillHeightmap(wx, wy, wz, vertCount, cols, rows, minX, minZ, stepX, stepZ) {
+    var heightmap = [];
+    var filled    = [];
+    for (var i = 0; i < cols * rows; i++) {
+        heightmap.push(0.0);
+        filled.push(false);
+    }
+
+    var collisions = 0;
+    var maxY       = -Infinity;
+
+    for (var i = 0; i < vertCount; i++) {
+        var xi  = Math.round((wx[i] - minX) / stepX);
+        var zi  = Math.round((wz[i] - minZ) / stepZ);
+        // Clamp to valid range
+        if (xi < 0) xi = 0; if (xi >= cols) xi = cols - 1;
+        if (zi < 0) zi = 0; if (zi >= rows) zi = rows - 1;
+        var idx = zi * cols + xi;
+        if (filled[idx]) collisions++;
+        filled[idx]    = true;
+        heightmap[idx] = wy[i];
+        if (wy[i] > maxY) maxY = wy[i];
+    }
+
+    return { heightmap: heightmap, collisions: collisions, maxY: maxY };
+}
+
 // Build a flat heightmap from a regular XZ-aligned terrain mesh.
-// Uses two methods to derive grid resolution and picks the best one.
+// Tries both possible grid orientations (cols x rows and rows x cols)
+// and picks the one with fewest collisions.
 // Grid vertex (xi, zi) -> Y stored at heightmap[zi * cols + xi].
-// stepX and stepZ may differ (rectangular cells are fine).
 function buildHeightmap(meshObj) {
     var core = meshObj.modCore();
     if (!core) core = meshObj.core();
@@ -49,74 +78,82 @@ function buildHeightmap(meshObj) {
         if (wv.z > maxZ) maxZ = wv.z;
     }
 
-    // Method 1: count vertices at minZ (works if verts are stored row-by-row)
+    // Derive cols candidates from quadratic formula.
+    // vertCount = cols * rows, polyCount = (cols-1)*(rows-1)
+    // => cols^2 - (V - P + 1)*cols + V = 0
+    var b            = -(vertCount - polyCount + 1);
+    var discriminant = b*b - 4*vertCount;
+    var sq           = Math.sqrt(Math.max(0, discriminant));
+    var c1           = Math.round((-b + sq) / 2);
+    var c2           = Math.round((-b - sq) / 2);
+
+    // Also try the row-counting method as a third candidate
     var MERGE_TOL = 1e-5;
     var colsByRow = 0;
     for (var i = 0; i < vertCount; i++) {
         if (Math.abs(wz[i] - minZ) < MERGE_TOL) colsByRow++;
     }
 
-    // Method 2: quadratic formula from vertCount and polyCount.
-    // A regular grid of cols x rows vertices has:
-    //   vertCount = cols * rows
-    //   polyCount = (cols-1) * (rows-1)
-    // Solving: cols^2 - (V - P + 1)*cols + V = 0
-    var colsByQuad = 0;
-    var b            = -(vertCount - polyCount + 1);
-    var discriminant = b*b - 4*vertCount;
-    if (discriminant >= 0) {
-        var sq = Math.sqrt(discriminant);
-        var c1 = Math.round((-b + sq) / 2);
-        var c2 = Math.round((-b - sq) / 2);
-        if (c1 > 1 && vertCount % c1 === 0) {
-            colsByQuad = c1;
-        } else if (c2 > 1 && vertCount % c2 === 0) {
-            colsByQuad = c2;
+    // Collect unique candidates (cols and their transpose rows)
+    var candidates = [];
+    function addCandidate(c) {
+        if (c > 1 && vertCount % c === 0) candidates.push(c);
+    }
+    addCandidate(c1);
+    addCandidate(c2);
+    addCandidate(Math.round(vertCount / c1)); // transpose of c1
+    addCandidate(Math.round(vertCount / c2)); // transpose of c2
+    addCandidate(colsByRow);
+    addCandidate(Math.round(vertCount / colsByRow));
+
+    print("TerrainProjector: Trying " + candidates.length + " grid orientations...");
+
+    // Try each candidate and pick the one with fewest collisions
+    var bestResult = null;
+    var bestCols   = 0;
+    var bestRows   = 0;
+    var bestStepX  = 0;
+    var bestStepZ  = 0;
+
+    for (var ci = 0; ci < candidates.length; ci++) {
+        var cols  = candidates[ci];
+        var rows  = Math.round(vertCount / cols);
+        var stepX = (maxX - minX) / (cols - 1);
+        var stepZ = (maxZ - minZ) / (rows - 1);
+
+        if (stepX <= 0 || stepZ <= 0) continue;
+
+        var result = tryFillHeightmap(wx, wy, wz, vertCount, cols, rows,
+                                      minX, minZ, stepX, stepZ);
+
+        print("  cols=" + cols + " rows=" + rows
+            + " stepX=" + stepX.toFixed(4) + " stepZ=" + stepZ.toFixed(4)
+            + " -> collisions=" + result.collisions);
+
+        if (bestResult === null || result.collisions < bestResult.collisions) {
+            bestResult = result;
+            bestCols   = cols;
+            bestRows   = rows;
+            bestStepX  = stepX;
+            bestStepZ  = stepZ;
         }
+
+        // Perfect solution found - no need to try more
+        if (result.collisions === 0) break;
     }
 
-    // Pick whichever method gives a result closest to square
-    var sqrtV = Math.sqrt(vertCount);
-    var cols;
-    if (colsByRow > 1 && colsByQuad > 1) {
-        cols = (Math.abs(colsByRow - sqrtV) <= Math.abs(colsByQuad - sqrtV))
-             ? colsByRow : colsByQuad;
-    } else if (colsByRow > 1) {
-        cols = colsByRow;
-    } else if (colsByQuad > 1) {
-        cols = colsByQuad;
-    } else {
-        // Last resort fallback
-        cols = Math.round(sqrtV);
-    }
-
-    var rows  = Math.round(vertCount / cols);
-    var stepX = (maxX - minX) / (cols - 1);
-    var stepZ = (maxZ - minZ) / (rows - 1);
-
-    print("TerrainProjector: Heightmap " + cols + "x" + rows
-        + " verts (" + (cols-1) + "x" + (rows-1) + " cells)"
-        + ", stepX=" + stepX.toFixed(5)
-        + ", stepZ=" + stepZ.toFixed(5)
-        + " (colsByRow=" + colsByRow + ", colsByQuad=" + colsByQuad + ")");
-
-    var heightmap = [];
-    for (var i = 0; i < cols * rows; i++) heightmap.push(0.0);
-
-    var maxY = -Infinity;
-    for (var i = 0; i < vertCount; i++) {
-        var xi = Math.round((wx[i] - minX) / stepX);
-        var zi = Math.round((wz[i] - minZ) / stepZ);
-        heightmap[zi * cols + xi] = wy[i];
-        if (wy[i] > maxY) maxY = wy[i];
-    }
+    print("TerrainProjector: Best orientation: " + bestCols + "x" + bestRows
+        + " verts (" + (bestCols-1) + "x" + (bestRows-1) + " cells)"
+        + ", stepX=" + bestStepX.toFixed(5)
+        + ", stepZ=" + bestStepZ.toFixed(5)
+        + ", collisions=" + bestResult.collisions);
 
     return {
-        heightmap: heightmap,
+        heightmap: bestResult.heightmap,
         minX: minX, minZ: minZ,
-        stepX: stepX, stepZ: stepZ,
-        cols: cols, rows: rows,
-        maxY: maxY
+        stepX: bestStepX, stepZ: bestStepZ,
+        cols: bestCols, rows: bestRows,
+        maxY: bestResult.maxY
     };
 }
 
