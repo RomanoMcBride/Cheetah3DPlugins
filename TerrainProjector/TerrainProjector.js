@@ -6,38 +6,27 @@
 // Usage:
 // 1. Select your road/map mesh
 // 2. tools -> script -> tag -> TerrainProjector.js
-// 3. In inspector, type the exact name of your terrain mesh into "Terrain Name"
+// 3. In inspector, drag your terrain mesh into the "Terrain" link slot
 // 4. Press the "Project" button in inspector
 //
 // Assumes the terrain is a regular grid mesh aligned to XZ.
-// Use Mesh -> Optimize on the terrain first if imported from FBX/OBJ to weld any duplicate vertices.
 // Uses bilinear interpolation on a flat heightmap for O(1) height
 // lookup per vertex. Points outside terrain bounds are clamped to
 // the nearest terrain edge.
 
 function buildUI(tool) {
     tool.addParameterSeparator("Terrain Projector");
-    tool.addParameterString("Terrain Name", "Terrain");
+    tool.addParameterLink("Terrain", false);
     tool.addParameterFloat("Y Offset", 0.0, -10.0, 10.0, false, false);
     tool.addParameterSeparator("Building Mode");
     tool.addParameterBool("Group Connected", false, false, false, false, false);
     tool.addParameterButton("Project", "Project onto Terrain", "projectOntoTerrain");
 }
 
-function findObjectByName(obj, name) {
-    if (obj.getParameter("name") === name) return obj;
-    for (var i = 0; i < obj.childCount(); i++) {
-        var found = findObjectByName(obj.childAtIndex(i), name);
-        if (found) return found;
-    }
-    return null;
-}
-
 // Build a flat heightmap from a regular XZ-aligned terrain mesh.
-// Derives grid resolution from polygon count using the quadratic formula.
+// Uses two methods to derive grid resolution and picks the best one.
 // Grid vertex (xi, zi) -> Y stored at heightmap[zi * cols + xi].
 // stepX and stepZ may differ (rectangular cells are fine).
-// Use Mesh > Optimize on the terrain before running if imported from FBX/OBJ.
 function buildHeightmap(meshObj) {
     var core = meshObj.modCore();
     if (!core) core = meshObj.core();
@@ -60,38 +49,56 @@ function buildHeightmap(meshObj) {
         if (wv.z > maxZ) maxZ = wv.z;
     }
 
-    // Derive cols from the quadratic relationship between vertCount and polyCount.
+    // Method 1: count vertices at minZ (works if verts are stored row-by-row)
+    var MERGE_TOL = 1e-5;
+    var colsByRow = 0;
+    for (var i = 0; i < vertCount; i++) {
+        if (Math.abs(wz[i] - minZ) < MERGE_TOL) colsByRow++;
+    }
+
+    // Method 2: quadratic formula from vertCount and polyCount.
     // A regular grid of cols x rows vertices has:
     //   vertCount = cols * rows
     //   polyCount = (cols-1) * (rows-1)
     // Solving: cols^2 - (V - P + 1)*cols + V = 0
+    var colsByQuad = 0;
     var b            = -(vertCount - polyCount + 1);
     var discriminant = b*b - 4*vertCount;
-    var cols, rows;
-
     if (discriminant >= 0) {
         var sq = Math.sqrt(discriminant);
         var c1 = Math.round((-b + sq) / 2);
         var c2 = Math.round((-b - sq) / 2);
         if (c1 > 1 && vertCount % c1 === 0) {
-            cols = c1;
+            colsByQuad = c1;
         } else if (c2 > 1 && vertCount % c2 === 0) {
-            cols = c2;
-        } else {
-            cols = (Math.abs(c1 - Math.sqrt(vertCount)) < Math.abs(c2 - Math.sqrt(vertCount))) ? c1 : c2;
+            colsByQuad = c2;
         }
-    } else {
-        cols = Math.round(Math.sqrt(vertCount));
     }
 
-    rows  = Math.round(vertCount / cols);
+    // Pick whichever method gives a result closest to square
+    var sqrtV = Math.sqrt(vertCount);
+    var cols;
+    if (colsByRow > 1 && colsByQuad > 1) {
+        cols = (Math.abs(colsByRow - sqrtV) <= Math.abs(colsByQuad - sqrtV))
+             ? colsByRow : colsByQuad;
+    } else if (colsByRow > 1) {
+        cols = colsByRow;
+    } else if (colsByQuad > 1) {
+        cols = colsByQuad;
+    } else {
+        // Last resort fallback
+        cols = Math.round(sqrtV);
+    }
+
+    var rows  = Math.round(vertCount / cols);
     var stepX = (maxX - minX) / (cols - 1);
     var stepZ = (maxZ - minZ) / (rows - 1);
 
     print("TerrainProjector: Heightmap " + cols + "x" + rows
         + " verts (" + (cols-1) + "x" + (rows-1) + " cells)"
         + ", stepX=" + stepX.toFixed(5)
-        + ", stepZ=" + stepZ.toFixed(5));
+        + ", stepZ=" + stepZ.toFixed(5)
+        + " (colsByRow=" + colsByRow + ", colsByQuad=" + colsByQuad + ")");
 
     var heightmap = [];
     for (var i = 0; i < cols * rows; i++) heightmap.push(0.0);
@@ -107,7 +114,6 @@ function buildHeightmap(meshObj) {
     return {
         heightmap: heightmap,
         minX: minX, minZ: minZ,
-        maxX: maxX, maxZ: maxZ,
         stepX: stepX, stepZ: stepZ,
         cols: cols, rows: rows,
         maxY: maxY
@@ -122,7 +128,7 @@ function sampleHeight(hm, x, z) {
     var gx = (x - hm.minX) / hm.stepX;
     var gz = (z - hm.minZ) / hm.stepZ;
 
-    // Clamp to valid cell range instead of returning null
+    // Clamp to valid cell range
     gx = Math.max(0, Math.min(gx, hm.cols - 1 - 1e-10));
     gz = Math.max(0, Math.min(gz, hm.rows - 1 - 1e-10));
 
@@ -204,7 +210,7 @@ function findConnectedComponents(core) {
 function projectOntoTerrain(tool) {
     var doc            = tool.document();
     var roadObj        = doc.selectedObject();
-    var terrainName    = tool.getParameter("Terrain Name");
+    var terrainObj     = tool.getParameter("Terrain");
     var yOffset        = tool.getParameter("Y Offset");
     var groupConnected = tool.getParameter("Group Connected");
 
@@ -212,23 +218,14 @@ function projectOntoTerrain(tool) {
         OS.messageBox("Error", "Please select the road/map mesh first.");
         return;
     }
-    if (!terrainName || terrainName === "") {
-        OS.messageBox("Error", "Please enter the terrain mesh name.");
-        return;
-    }
-
-    var terrainObj = findObjectByName(doc.root(), terrainName);
     if (!terrainObj) {
-        OS.messageBox("Error", "Could not find object named '" + terrainName + "'.");
+        OS.messageBox("Error", "Please drag a terrain mesh into the Terrain slot.");
         return;
     }
 
     print("TerrainProjector: Building heightmap...");
     var hm = buildHeightmap(terrainObj);
     print("TerrainProjector: Terrain max Y = " + hm.maxY);
-    print("TerrainProjector: Terrain XZ bounds: ("
-        + hm.minX.toFixed(2) + ", " + hm.minZ.toFixed(2) + ") to ("
-        + hm.maxX.toFixed(2) + ", " + hm.maxZ.toFixed(2) + ")");
 
     var roadCore = roadObj.core();
     if (!roadCore || roadCore.vertexCount() === 0) {
