@@ -10,8 +10,10 @@
 // 4. Press the "Project" button in inspector
 //
 // Assumes the terrain is a regular grid mesh aligned to XZ.
+// Use Mesh -> Optimize on the terrain first if imported from FBX/OBJ to weld any duplicate vertices.
 // Uses bilinear interpolation on a flat heightmap for O(1) height
-// lookup per vertex.
+// lookup per vertex. Points outside terrain bounds are clamped to
+// the nearest terrain edge.
 
 function buildUI(tool) {
     tool.addParameterSeparator("Terrain Projector");
@@ -32,13 +34,16 @@ function findObjectByName(obj, name) {
 }
 
 // Build a flat heightmap from a regular XZ-aligned terrain mesh.
+// Derives grid resolution from polygon count using the quadratic formula.
 // Grid vertex (xi, zi) -> Y stored at heightmap[zi * cols + xi].
 // stepX and stepZ may differ (rectangular cells are fine).
+// Use Mesh > Optimize on the terrain before running if imported from FBX/OBJ.
 function buildHeightmap(meshObj) {
     var core = meshObj.modCore();
     if (!core) core = meshObj.core();
     var matrix    = meshObj.obj2WorldMatrix();
     var vertCount = core.vertexCount();
+    var polyCount = core.polygonCount();
 
     var minX =  Infinity, maxX = -Infinity;
     var minZ =  Infinity, maxZ = -Infinity;
@@ -55,19 +60,38 @@ function buildHeightmap(meshObj) {
         if (wv.z > maxZ) maxZ = wv.z;
     }
 
-    // Count vertices in the first row (Z ~ minZ) to get cols
-    var MERGE_TOL = 1e-5;
-    var cols = 0;
-    for (var i = 0; i < vertCount; i++) {
-        if (Math.abs(wz[i] - minZ) < MERGE_TOL) cols++;
+    // Derive cols from the quadratic relationship between vertCount and polyCount.
+    // A regular grid of cols x rows vertices has:
+    //   vertCount = cols * rows
+    //   polyCount = (cols-1) * (rows-1)
+    // Solving: cols^2 - (V - P + 1)*cols + V = 0
+    var b            = -(vertCount - polyCount + 1);
+    var discriminant = b*b - 4*vertCount;
+    var cols, rows;
+
+    if (discriminant >= 0) {
+        var sq = Math.sqrt(discriminant);
+        var c1 = Math.round((-b + sq) / 2);
+        var c2 = Math.round((-b - sq) / 2);
+        if (c1 > 1 && vertCount % c1 === 0) {
+            cols = c1;
+        } else if (c2 > 1 && vertCount % c2 === 0) {
+            cols = c2;
+        } else {
+            cols = (Math.abs(c1 - Math.sqrt(vertCount)) < Math.abs(c2 - Math.sqrt(vertCount))) ? c1 : c2;
+        }
+    } else {
+        cols = Math.round(Math.sqrt(vertCount));
     }
-    var rows  = vertCount / cols;
+
+    rows  = Math.round(vertCount / cols);
     var stepX = (maxX - minX) / (cols - 1);
     var stepZ = (maxZ - minZ) / (rows - 1);
 
     print("TerrainProjector: Heightmap " + cols + "x" + rows
-        + " verts, stepX=" + stepX.toFixed(5)
-        + " stepZ=" + stepZ.toFixed(5));
+        + " verts (" + (cols-1) + "x" + (rows-1) + " cells)"
+        + ", stepX=" + stepX.toFixed(5)
+        + ", stepZ=" + stepZ.toFixed(5));
 
     var heightmap = [];
     for (var i = 0; i < cols * rows; i++) heightmap.push(0.0);
@@ -83,6 +107,7 @@ function buildHeightmap(meshObj) {
     return {
         heightmap: heightmap,
         minX: minX, minZ: minZ,
+        maxX: maxX, maxZ: maxZ,
         stepX: stepX, stepZ: stepZ,
         cols: cols, rows: rows,
         maxY: maxY
@@ -91,15 +116,18 @@ function buildHeightmap(meshObj) {
 
 // Sample terrain height at world (x, z) using bilinear interpolation.
 // The quad is split along the BL-TR diagonal to match the mesh topology.
-// Returns Y or null if the point is outside the terrain bounds.
+// Points outside terrain bounds are clamped to the nearest terrain edge,
+// effectively extending the heightmap infinitely in all directions.
 function sampleHeight(hm, x, z) {
     var gx = (x - hm.minX) / hm.stepX;
     var gz = (z - hm.minZ) / hm.stepZ;
 
+    // Clamp to valid cell range instead of returning null
+    gx = Math.max(0, Math.min(gx, hm.cols - 1 - 1e-10));
+    gz = Math.max(0, Math.min(gz, hm.rows - 1 - 1e-10));
+
     var cx = Math.floor(gx);
     var cz = Math.floor(gz);
-
-    if (cx < 0 || cx >= hm.cols - 1 || cz < 0 || cz >= hm.rows - 1) return null;
 
     var fx = gx - cx;
     var fz = gz - cz;
@@ -118,11 +146,12 @@ function sampleHeight(hm, x, z) {
     }
 }
 
-// Build a vertex adjacency list from polygon data.
+// Build a vertex adjacency list using a hash set for deduplication.
 function buildVertexAdjacency(core) {
     var vertCount = core.vertexCount();
     var polyCount = core.polygonCount();
-    var adj = [];
+    var edgeSet   = {};
+    var adj       = [];
     for (var i = 0; i < vertCount; i++) adj.push([]);
 
     for (var p = 0; p < polyCount; p++) {
@@ -132,12 +161,12 @@ function buildVertexAdjacency(core) {
         for (var a = 0; a < polyVerts.length; a++) {
             for (var b = 0; b < polyVerts.length; b++) {
                 if (a === b) continue;
-                var va = polyVerts[a], vb = polyVerts[b];
-                var found = false;
-                for (var k = 0; k < adj[va].length; k++) {
-                    if (adj[va][k] === vb) { found = true; break; }
+                var va  = polyVerts[a], vb = polyVerts[b];
+                var key = va + "_" + vb;
+                if (!edgeSet[key]) {
+                    edgeSet[key] = true;
+                    adj[va].push(vb);
                 }
-                if (!found) adj[va].push(vb);
             }
         }
     }
@@ -197,6 +226,9 @@ function projectOntoTerrain(tool) {
     print("TerrainProjector: Building heightmap...");
     var hm = buildHeightmap(terrainObj);
     print("TerrainProjector: Terrain max Y = " + hm.maxY);
+    print("TerrainProjector: Terrain XZ bounds: ("
+        + hm.minX.toFixed(2) + ", " + hm.minZ.toFixed(2) + ") to ("
+        + hm.maxX.toFixed(2) + ", " + hm.maxZ.toFixed(2) + ")");
 
     var roadCore = roadObj.core();
     if (!roadCore || roadCore.vertexCount() === 0) {
